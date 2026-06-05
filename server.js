@@ -173,7 +173,7 @@ app.post('/yuno/payments', async (req, res) => {
     console.log('[/yuno/payments] Calling Yuno:', JSON.stringify(yunoBody, null, 2));
 
     const yunoResponse = await axios.post(
-      `${config.yuno.baseUrl}/v1/payment_intents`,
+      `${config.yuno.baseUrl}/v1/payments`,
       yunoBody,
       {
         headers: {
