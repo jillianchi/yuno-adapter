@@ -103,6 +103,32 @@ app.post('/yuno/payments', async (req, res) => {
   }
   console.log('[/yuno/payments] Stripe payload:', JSON.stringify(stripePayload, null, 2));
 
+  // ── 1b. Route by event type ────────────────────────────────────────────────
+  // Stripe calls this endpoint for multiple event types:
+  //   confirm_payment  → initiate payment, return requires_action + redirect URL
+  //   get_payment_status (or similar) → return current status after customer returns
+  const eventType = stripePayload.type || '';
+  const par = stripePayload.data?.payment_attempt_record;
+
+  if (eventType !== 'payments.orchestration.adapter.confirm_payment') {
+    // Unknown/status-check event — look up stored session and return current status
+    console.log(`[/yuno/payments] Non-confirm event type: "${eventType}" — checking session`);
+    const session = par ? sessions.get(par) : null;
+    if (session) {
+      console.log(`[/yuno/payments] Found session for PAR ${par}, returning guaranteed`);
+      return res.status(200).json({
+        status: 'guaranteed',
+        payment_reference: session.yunoPaymentId,
+      });
+    }
+    // No session found — return failed so Stripe doesn't spin forever
+    console.warn(`[/yuno/payments] No session for PAR ${par} on event "${eventType}" — returning failed`);
+    return res.status(200).json({
+      status: 'failed',
+      error_code: 'payment_not_found',
+    });
+  }
+
   // ── 2. Verify Stripe signature ─────────────────────────────────────────────
   // NOTE: uncomment once you've retrieved whsec_... from Dashboard → Developers → Webhooks
   // const Stripe = require('stripe');
@@ -291,28 +317,10 @@ app.get('/yuno/return', async (req, res) => {
   const resolvedYunoId = yunoPaymentId || session?.yunoPaymentId || 'unknown';
   console.log(`[/yuno/return] PAR=${par} yunoId=${resolvedYunoId}`);
 
-  // ── Call Stripe Payment Records API BEFORE redirecting ─────────────────────
-  // Stripe's checkout spinner waits for this — without it the page spins forever.
-  // For POC: trust that redirect back = success (verify via Yuno API in production).
-  if (par && config.stripe.secretKey) {
-    try {
-      await axios.post(
-        `https://api.stripe.com/v1/payment_records/${par}/report_payment_attempt_guaranteed`,
-        '',   // no body params required
-        {
-          headers: {
-            'Authorization': `Bearer ${config.stripe.secretKey}`,
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Stripe-Version': '2025-03-31.basil; checkout_merchant_instructed_orchestration_preview=v1',
-          },
-        }
-      );
-      console.log(`[/yuno/return] ✅ Reported GUARANTEED to Stripe for PAR ${par}`);
-    } catch (e) {
-      // Log but don't block the redirect — customer UX is more important
-      console.error('[/yuno/return] Stripe report error:', e.response?.data || e.message);
-    }
-  }
+  // NOTE: Do NOT call report_payment_attempt_guaranteed here —
+  // Stripe's checkout session must close first. Instead, Stripe calls
+  // /yuno/payments again with a status-check event, and we return "guaranteed"
+  // from there. See the event router at the top of POST /yuno/payments.
 
   // ── Redirect customer to Stripe's checkout success page ────────────────────
   const destination = stripe_return ? decodeURIComponent(stripe_return) : null;
@@ -358,37 +366,32 @@ app.post('/yuno/webhook', async (req, res) => {
   }
 
   try {
+    const stripeHeaders = {
+      'Authorization': `Bearer ${config.stripe.secretKey}`,
+      'Stripe-Version': '2025-03-31.basil; checkout_merchant_instructed_orchestration_preview=v1',
+    };
+    // Look up parent pr_... from par_...
+    const parData = await axios.get(
+      `https://api.stripe.com/v1/payment_attempt_records/${par}`,
+      { headers: stripeHeaders }
+    );
+    const prId = parData.data.payment_record;
+
     if (yunoStatus === 'SUCCEEDED' || yunoStatus === 'CAPTURED') {
-      // Report guaranteed payment to Stripe
       await axios.post(
-        `https://api.stripe.com/v1/payment_records/${par}/report_payment_attempt_guaranteed`,
-        '',   // no body params required
-        {
-          headers: {
-            'Authorization': `Bearer ${config.stripe.secretKey}`,
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Stripe-Version': '2025-03-31.basil; checkout_merchant_instructed_orchestration_preview=v1',
-          },
-        }
+        `https://api.stripe.com/v1/payment_records/${prId}/report_payment_attempt_guaranteed`,
+        '',
+        { headers: { ...stripeHeaders, 'Content-Type': 'application/x-www-form-urlencoded' } }
       );
-      console.log(`[/yuno/webhook] ✅ Reported GUARANTEED to Stripe for PAR ${par}`);
+      console.log(`[/yuno/webhook] ✅ Reported GUARANTEED to Stripe for PR ${prId}`);
 
     } else if (yunoStatus === 'FAILED' || yunoStatus === 'CANCELLED' || yunoStatus === 'REJECTED') {
-      // Report failed payment to Stripe
       await axios.post(
-        `https://api.stripe.com/v1/payment_records/${par}/report_payment_attempt_failed`,
-        new URLSearchParams({
-          'failed_at': Math.floor(Date.now() / 1000).toString(),
-        }).toString(),
-        {
-          headers: {
-            'Authorization': `Bearer ${config.stripe.secretKey}`,
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Stripe-Version': '2025-03-31.basil; checkout_merchant_instructed_orchestration_preview=v1',
-          },
-        }
+        `https://api.stripe.com/v1/payment_records/${prId}/report_payment_attempt_failed`,
+        '',
+        { headers: { ...stripeHeaders, 'Content-Type': 'application/x-www-form-urlencoded' } }
       );
-      console.log(`[/yuno/webhook] ❌ Reported FAILED to Stripe for PAR ${par}`);
+      console.log(`[/yuno/webhook] ❌ Reported FAILED to Stripe for PR ${prId}`);
     }
   } catch (e) {
     console.error('[/yuno/webhook] Stripe Payment Records error:', e.response?.data || e.message);
