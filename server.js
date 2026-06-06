@@ -298,9 +298,7 @@ app.get('/yuno/return', async (req, res) => {
     try {
       await axios.post(
         `https://api.stripe.com/v1/payment_records/${par}/report_payment_attempt_guaranteed`,
-        new URLSearchParams({
-          payment_reference: resolvedYunoId,
-        }).toString(),
+        '',   // no body params required
         {
           headers: {
             'Authorization': `Bearer ${config.stripe.secretKey}`,
@@ -364,9 +362,7 @@ app.post('/yuno/webhook', async (req, res) => {
       // Report guaranteed payment to Stripe
       await axios.post(
         `https://api.stripe.com/v1/payment_records/${par}/report_payment_attempt_guaranteed`,
-        new URLSearchParams({
-          'payment_reference': yunoPaymentId || par,
-        }).toString(),
+        '',   // no body params required
         {
           headers: {
             'Authorization': `Bearer ${config.stripe.secretKey}`,
