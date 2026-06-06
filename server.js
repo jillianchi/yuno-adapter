@@ -174,10 +174,13 @@ app.post('/yuno/payments', async (req, res) => {
         country:    'MY',
       },
       payment_method: {
-        type: yunoPaymentMethod,                     // 'DUIT_NOW' | 'TOUCH_N_GO'
+        type: yunoPaymentMethod,
       },
-      checkout: {                                    // required — return_url lives here
-        return_url:  yunoReturnUrl,
+      // callback_url = top-level field Yuno uses as success_redirect_url when
+      // creating the underlying PSP invoice (confirmed in Yuno docs).
+      // This is what Xendit receives as success_redirect_url / failure_redirect_url.
+      callback_url: yunoReturnUrl,
+      checkout: {
         webhook_url: `${config.adapter.baseUrl}/yuno/webhook`,
       },
     };
@@ -292,7 +295,7 @@ app.get('/yuno/return', async (req, res) => {
 // Yuno sends async payment notifications here.
 // Useful for confirming final payment status independently of the redirect.
 // ═════════════════════════════════════════════════════════════════════════════
-app.post('/yuno/webhook', (req, res) => {
+app.post('/yuno/webhook', async (req, res) => {
   console.log('\n[/yuno/webhook] Yuno event received');
   let body;
   try {
@@ -302,9 +305,61 @@ app.post('/yuno/webhook', (req, res) => {
   }
   console.log('[/yuno/webhook] Payload:', JSON.stringify(body, null, 2));
 
-  // TODO: validate Yuno webhook signature, update payment state
-  // For demo, just acknowledge
+  // Acknowledge immediately so Yuno doesn't retry
   res.status(200).json({ received: true });
+
+  // ── Report outcome to Stripe Payment Records API ──────────────────────────
+  // Yuno webhook statuses: SUCCEEDED, FAILED, PENDING, REFUNDED, etc.
+  const yunoStatus    = body?.payment_status || body?.status;
+  const yunoPaymentId = body?.payment_id     || body?.id;
+  // merchant_order_id = par_test_... (we set this when creating the Yuno payment)
+  const par           = body?.merchant_order_id;
+
+  console.log(`[/yuno/webhook] status=${yunoStatus} payment_id=${yunoPaymentId} par=${par}`);
+
+  if (!par || !config.stripe.secretKey) {
+    console.log('[/yuno/webhook] Missing PAR or Stripe key — skipping Payment Records report');
+    return;
+  }
+
+  try {
+    if (yunoStatus === 'SUCCEEDED' || yunoStatus === 'CAPTURED') {
+      // Report guaranteed payment to Stripe
+      await axios.post(
+        `https://api.stripe.com/v1/payment_records/${par}/report_payment_attempt_guaranteed`,
+        new URLSearchParams({
+          'payment_reference': yunoPaymentId || par,
+        }).toString(),
+        {
+          headers: {
+            'Authorization': `Bearer ${config.stripe.secretKey}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Stripe-Version': '2025-03-31.basil; checkout_merchant_instructed_orchestration_preview=v1',
+          },
+        }
+      );
+      console.log(`[/yuno/webhook] ✅ Reported GUARANTEED to Stripe for PAR ${par}`);
+
+    } else if (yunoStatus === 'FAILED' || yunoStatus === 'CANCELLED' || yunoStatus === 'REJECTED') {
+      // Report failed payment to Stripe
+      await axios.post(
+        `https://api.stripe.com/v1/payment_records/${par}/report_payment_attempt_failed`,
+        new URLSearchParams({
+          'failed_at': Math.floor(Date.now() / 1000).toString(),
+        }).toString(),
+        {
+          headers: {
+            'Authorization': `Bearer ${config.stripe.secretKey}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Stripe-Version': '2025-03-31.basil; checkout_merchant_instructed_orchestration_preview=v1',
+          },
+        }
+      );
+      console.log(`[/yuno/webhook] ❌ Reported FAILED to Stripe for PAR ${par}`);
+    }
+  } catch (e) {
+    console.error('[/yuno/webhook] Stripe Payment Records error:', e.response?.data || e.message);
+  }
 });
 
 
