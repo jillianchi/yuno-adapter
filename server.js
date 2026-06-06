@@ -178,13 +178,11 @@ app.post('/yuno/payments', async (req, res) => {
   // ── 4. Call Yuno API to create payment session ────────────────────────────
   let yunoPaymentIntent;
   try {
-    // yunoReturnUrl is what Yuno passes to Xendit as success_redirect_url.
-    // We include stripe_return + par so /yuno/return can call Stripe and redirect the customer.
-    // yuno_id is added after Yuno responds (see below); placeholder here, patched after.
-    const yunoReturnUrlBase =
-      `${config.adapter.baseUrl}/yuno/return` +
-      `?stripe_return=${encodeURIComponent(stripeReturnUrl)}` +
-      `&par=${encodeURIComponent(paymentAttemptRecord)}`;
+    // callback_url must be Stripe's own return_url directly.
+    // Stripe's checkout page processes the CPMT return when the PSP redirects here,
+    // closes the session, and sends the customer to success_url.
+    // Intercepting this at /yuno/return breaks Stripe's processing flow.
+    const yunoReturnUrlBase = stripeReturnUrl;
 
     const yunoBody = {
       account_id:        config.yuno.accountId,      // required in body (not just header)
@@ -295,88 +293,15 @@ app.post('/yuno/payments', async (req, res) => {
 
 
 // ═════════════════════════════════════════════════════════════════════════════
-// GET /yuno/return
-// Yuno redirects the customer here after payment (success or failure).
-// We verify the outcome, then send the customer to Stripe's success_url.
+// GET /yuno/return  (no longer in the main customer path)
+// callback_url is now set to data.return_url (Stripe's checkout URL) directly,
+// so the PSP redirects the customer straight to Stripe — not through here.
+// This endpoint is kept as a diagnostic stub only.
 // ═════════════════════════════════════════════════════════════════════════════
-app.get('/yuno/return', async (req, res) => {
-  console.log('\n[/yuno/return] Customer returned from Yuno');
+app.get('/yuno/return', (req, res) => {
+  console.log('\n[/yuno/return] Hit — this should no longer be called in normal flow');
   console.log('[/yuno/return] Query:', req.query);
-
-  const { stripe_return, par } = req.query;
-
-  // Yuno may pass payment status query params — log them all
-  // e.g. ?status=SUCCEEDED&payment_id=xxx or similar
-  const yunoStatus = req.query.status || req.query.payment_status;
-  const yunoPaymentId = req.query.payment_id || req.query.id;
-
-  console.log(`[/yuno/return] Query params:`, req.query);
-
-  // ── Look up session to get Yuno payment ID ─────────────────────────────────
-  const session = par ? sessions.get(par) : null;
-  const resolvedYunoId = yunoPaymentId || session?.yunoPaymentId || 'unknown';
-  console.log(`[/yuno/return] PAR=${par} yunoId=${resolvedYunoId}`);
-
-  // ── Redirect customer to Stripe's checkout page first ─────────────────────
-  // The checkout session transitions out of "open" when the customer's browser
-  // lands on Stripe's URL. We redirect immediately, then call
-  // report_payment_attempt_guaranteed async with retries.
-  const destination = stripe_return ? decodeURIComponent(stripe_return) : null;
-  if (destination) {
-    console.log(`[/yuno/return] Redirecting to Stripe: ${destination}`);
-    res.redirect(destination);  // send 302 NOW — don't await anything
-  } else {
-    res.send('<h1>Payment complete</h1><p>You can close this window.</p>');
-  }
-
-  // ── Report GUARANTEED to Stripe async (after redirect is sent) ─────────────
-  // Retry up to 6 times with back-off — session may still be "open" for a
-  // brief window after the customer lands on Stripe's page.
-  if (par && config.stripe.secretKey) {
-    const stripeHeaders = {
-      'Authorization': `Bearer ${config.stripe.secretKey}`,
-      'Stripe-Version': '2025-03-31.basil; checkout_merchant_instructed_orchestration_preview=v1',
-    };
-    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-    (async () => {
-      let prId;
-      try {
-        const parData = await axios.get(
-          `https://api.stripe.com/v1/payment_attempt_records/${par}`,
-          { headers: stripeHeaders }
-        );
-        prId = parData.data.payment_record;
-        console.log(`[/yuno/return async] PAR ${par} → PR ${prId}`);
-      } catch (e) {
-        console.error('[/yuno/return async] Failed to fetch PAR:', e.response?.data || e.message);
-        return;
-      }
-
-      const delays = [1000, 2000, 3000, 5000, 8000, 13000]; // ms between retries
-      for (let i = 0; i < delays.length; i++) {
-        await sleep(delays[i]);
-        try {
-          await axios.post(
-            `https://api.stripe.com/v1/payment_records/${prId}/report_payment_attempt_guaranteed`,
-            '',
-            { headers: { ...stripeHeaders, 'Content-Type': 'application/x-www-form-urlencoded' } }
-          );
-          console.log(`[/yuno/return async] ✅ GUARANTEED reported for PR ${prId} on attempt ${i + 1}`);
-          return; // success — stop retrying
-        } catch (e) {
-          const msg = e.response?.data?.error?.message || e.message;
-          console.warn(`[/yuno/return async] Attempt ${i + 1} failed: ${msg}`);
-          // If it's NOT a "session is open" error, stop retrying
-          if (!msg.includes('Checkout Session is open')) {
-            console.error('[/yuno/return async] Non-retryable error — giving up');
-            return;
-          }
-        }
-      }
-      console.error(`[/yuno/return async] ❌ All retries exhausted for PR ${prId}`);
-    })();
-  }
+  res.send('<h1>Adapter return stub</h1><p>This endpoint is no longer in the payment flow.</p>');
 });
 
 
