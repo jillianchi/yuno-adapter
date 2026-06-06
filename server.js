@@ -144,8 +144,8 @@ app.post('/yuno/payments', async (req, res) => {
   const merchantOrderId = paymentAttemptRecord || rfcId;
 
   // Determine Yuno payment method from CPMT ID
-  // (CPMT ID is in the return_url query param redirect_pm_type — extract if needed)
-  const yunoPaymentMethod = 'DUIT_NOW'; // default; extend CPMT_TO_YUNO_PM map for TNG etc.
+  // Confirmed type strings: TOUCH_AND_GO (not TOUCH_N_GO), DUIT_NOW
+  const yunoPaymentMethod = 'TOUCH_AND_GO';
 
   console.log('[/yuno/payments] Resolved:', { amount, currency, yunoPaymentMethod, merchantOrderId });
 
@@ -214,9 +214,10 @@ app.post('/yuno/payments', async (req, res) => {
   }
 
   // ── 5. Return Yuno's redirect URL to Stripe ───────────────────────────────
-  // Yuno response shape: yunoPaymentIntent.checkout.redirect_to
-  // (verify in Yuno sandbox — may also be yunoPaymentIntent.redirect_url)
-  const redirectUrl = yunoPaymentIntent?.checkout?.redirect_to
+  // Confirmed from Yuno response (2026-06-06):
+  //   payment_method.payment_method_detail.wallet.redirect_url
+  const redirectUrl = yunoPaymentIntent?.payment_method?.payment_method_detail?.wallet?.redirect_url
+                   || yunoPaymentIntent?.checkout?.redirect_to
                    || yunoPaymentIntent?.redirect_url;
 
   if (!redirectUrl) {
