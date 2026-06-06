@@ -317,19 +317,66 @@ app.get('/yuno/return', async (req, res) => {
   const resolvedYunoId = yunoPaymentId || session?.yunoPaymentId || 'unknown';
   console.log(`[/yuno/return] PAR=${par} yunoId=${resolvedYunoId}`);
 
-  // NOTE: Do NOT call report_payment_attempt_guaranteed here —
-  // Stripe's checkout session must close first. Instead, Stripe calls
-  // /yuno/payments again with a status-check event, and we return "guaranteed"
-  // from there. See the event router at the top of POST /yuno/payments.
-
-  // ── Redirect customer to Stripe's checkout success page ────────────────────
+  // ── Redirect customer to Stripe's checkout page first ─────────────────────
+  // The checkout session transitions out of "open" when the customer's browser
+  // lands on Stripe's URL. We redirect immediately, then call
+  // report_payment_attempt_guaranteed async with retries.
   const destination = stripe_return ? decodeURIComponent(stripe_return) : null;
   if (destination) {
     console.log(`[/yuno/return] Redirecting to Stripe: ${destination}`);
-    return res.redirect(destination);
+    res.redirect(destination);  // send 302 NOW — don't await anything
+  } else {
+    res.send('<h1>Payment complete</h1><p>You can close this window.</p>');
   }
 
-  res.send('<h1>Payment complete</h1><p>You can close this window.</p>');
+  // ── Report GUARANTEED to Stripe async (after redirect is sent) ─────────────
+  // Retry up to 6 times with back-off — session may still be "open" for a
+  // brief window after the customer lands on Stripe's page.
+  if (par && config.stripe.secretKey) {
+    const stripeHeaders = {
+      'Authorization': `Bearer ${config.stripe.secretKey}`,
+      'Stripe-Version': '2025-03-31.basil; checkout_merchant_instructed_orchestration_preview=v1',
+    };
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    (async () => {
+      let prId;
+      try {
+        const parData = await axios.get(
+          `https://api.stripe.com/v1/payment_attempt_records/${par}`,
+          { headers: stripeHeaders }
+        );
+        prId = parData.data.payment_record;
+        console.log(`[/yuno/return async] PAR ${par} → PR ${prId}`);
+      } catch (e) {
+        console.error('[/yuno/return async] Failed to fetch PAR:', e.response?.data || e.message);
+        return;
+      }
+
+      const delays = [1000, 2000, 3000, 5000, 8000, 13000]; // ms between retries
+      for (let i = 0; i < delays.length; i++) {
+        await sleep(delays[i]);
+        try {
+          await axios.post(
+            `https://api.stripe.com/v1/payment_records/${prId}/report_payment_attempt_guaranteed`,
+            '',
+            { headers: { ...stripeHeaders, 'Content-Type': 'application/x-www-form-urlencoded' } }
+          );
+          console.log(`[/yuno/return async] ✅ GUARANTEED reported for PR ${prId} on attempt ${i + 1}`);
+          return; // success — stop retrying
+        } catch (e) {
+          const msg = e.response?.data?.error?.message || e.message;
+          console.warn(`[/yuno/return async] Attempt ${i + 1} failed: ${msg}`);
+          // If it's NOT a "session is open" error, stop retrying
+          if (!msg.includes('Checkout Session is open')) {
+            console.error('[/yuno/return async] Non-retryable error — giving up');
+            return;
+          }
+        }
+      }
+      console.error(`[/yuno/return async] ❌ All retries exhausted for PR ${prId}`);
+    })();
+  }
 });
 
 
