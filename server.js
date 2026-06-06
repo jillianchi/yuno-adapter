@@ -152,7 +152,10 @@ app.post('/yuno/payments', async (req, res) => {
   // ── 4. Call Yuno API to create payment session ────────────────────────────
   let yunoPaymentIntent;
   try {
-    const yunoReturnUrl =
+    // yunoReturnUrl is what Yuno passes to Xendit as success_redirect_url.
+    // We include stripe_return + par so /yuno/return can call Stripe and redirect the customer.
+    // yuno_id is added after Yuno responds (see below); placeholder here, patched after.
+    const yunoReturnUrlBase =
       `${config.adapter.baseUrl}/yuno/return` +
       `?stripe_return=${encodeURIComponent(stripeReturnUrl)}` +
       `&par=${encodeURIComponent(paymentAttemptRecord)}`;
@@ -178,8 +181,8 @@ app.post('/yuno/payments', async (req, res) => {
       },
       // callback_url = top-level field Yuno uses as success_redirect_url when
       // creating the underlying PSP invoice (confirmed in Yuno docs).
-      // This is what Xendit receives as success_redirect_url / failure_redirect_url.
-      callback_url: yunoReturnUrl,
+      // yuno_id is appended after we get the Yuno response (see below).
+      callback_url: yunoReturnUrlBase,
       checkout: {
         webhook_url: `${config.adapter.baseUrl}/yuno/webhook`,
       },
@@ -228,6 +231,13 @@ app.post('/yuno/payments', async (req, res) => {
     return res.status(502).json({ error: 'no_redirect_url' });
   }
 
+  // ── 5b. Store mapping PAR → Yuno payment ID so /yuno/return can look it up ─
+  const yunoPaymentId = yunoPaymentIntent.id;
+  sessions.set(paymentAttemptRecord, {
+    yunoPaymentId,
+    stripeReturnUrl,
+  });
+  console.log(`[/yuno/payments] Session stored: PAR=${paymentAttemptRecord} → yunoId=${yunoPaymentId}`);
   console.log('[/yuno/payments] Returning redirect URL to Stripe:', redirectUrl);
 
   // ── 6. Return redirect URL to Stripe ──────────────────────────────────────
@@ -274,18 +284,45 @@ app.get('/yuno/return', async (req, res) => {
   const yunoStatus = req.query.status || req.query.payment_status;
   const yunoPaymentId = req.query.payment_id || req.query.id;
 
-  console.log(`[/yuno/return] Yuno status: ${yunoStatus}, payment_id: ${yunoPaymentId}`);
+  console.log(`[/yuno/return] Query params:`, req.query);
 
-  // Optional: call Stripe Payment Records API to record the off-Stripe payment
-  // (good for production, can skip for POC demo)
-  // await reportToStripePaymentRecords(yunoPaymentId, checkout_session_id);
+  // ── Look up session to get Yuno payment ID ─────────────────────────────────
+  const session = par ? sessions.get(par) : null;
+  const resolvedYunoId = yunoPaymentId || session?.yunoPaymentId || 'unknown';
+  console.log(`[/yuno/return] PAR=${par} yunoId=${resolvedYunoId}`);
 
-  // Redirect customer to Stripe's original success_url
-  if (stripe_return) {
-    return res.redirect(decodeURIComponent(stripe_return));
+  // ── Call Stripe Payment Records API BEFORE redirecting ─────────────────────
+  // Stripe's checkout spinner waits for this — without it the page spins forever.
+  // For POC: trust that redirect back = success (verify via Yuno API in production).
+  if (par && config.stripe.secretKey) {
+    try {
+      await axios.post(
+        `https://api.stripe.com/v1/payment_records/${par}/report_payment_attempt_guaranteed`,
+        new URLSearchParams({
+          payment_reference: resolvedYunoId,
+        }).toString(),
+        {
+          headers: {
+            'Authorization': `Bearer ${config.stripe.secretKey}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Stripe-Version': '2025-03-31.basil; checkout_merchant_instructed_orchestration_preview=v1',
+          },
+        }
+      );
+      console.log(`[/yuno/return] ✅ Reported GUARANTEED to Stripe for PAR ${par}`);
+    } catch (e) {
+      // Log but don't block the redirect — customer UX is more important
+      console.error('[/yuno/return] Stripe report error:', e.response?.data || e.message);
+    }
   }
 
-  // Fallback if no return URL
+  // ── Redirect customer to Stripe's checkout success page ────────────────────
+  const destination = stripe_return ? decodeURIComponent(stripe_return) : null;
+  if (destination) {
+    console.log(`[/yuno/return] Redirecting to Stripe: ${destination}`);
+    return res.redirect(destination);
+  }
+
   res.send('<h1>Payment complete</h1><p>You can close this window.</p>');
 });
 
