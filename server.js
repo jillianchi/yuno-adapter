@@ -158,12 +158,15 @@ app.post('/yuno/payments', async (req, res) => {
       `&par=${encodeURIComponent(paymentAttemptRecord)}`;
 
     const yunoBody = {
-      amount:            amount,
-      currency:          currency?.toUpperCase() || 'MYR',
       merchant_order_id: merchantOrderId,
       description:       'IHG Hotel Malaysia',
+      country:           'MY',                       // required for Yuno payment method routing
+      amount: {
+        value:    amount,                            // must be object { value, currency }
+        currency: currency?.toUpperCase() || 'MYR',
+      },
       payment_method: {
-        type:     yunoPaymentMethod,
+        type:     yunoPaymentMethod,                 // 'DUIT_NOW' | 'TOUCH_N_GO'
         workflow: 'REDIRECT',
       },
       return_url:  yunoReturnUrl,
@@ -180,6 +183,7 @@ app.post('/yuno/payments', async (req, res) => {
           'private-secret-key':  config.yuno.privateKey,
           'public-api-key':      config.yuno.publicKey,
           'merchant-account-id': config.yuno.accountId,
+          'x-idempotency-key':   merchantOrderId,   // required by Yuno; PAR is unique per attempt
           'Content-Type':        'application/json',
         },
       }
