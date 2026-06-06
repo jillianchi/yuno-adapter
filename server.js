@@ -158,19 +158,28 @@ app.post('/yuno/payments', async (req, res) => {
       `&par=${encodeURIComponent(paymentAttemptRecord)}`;
 
     const yunoBody = {
+      account_id:        config.yuno.accountId,      // required in body (not just header)
       merchant_order_id: merchantOrderId,
       description:       'IHG Hotel Malaysia',
-      country:           'MY',                       // required for Yuno payment method routing
+      country:           'MY',
+      workflow:          'REDIRECT',                 // top-level, not inside payment_method
       amount: {
-        value:    amount,                            // must be object { value, currency }
         currency: currency?.toUpperCase() || 'MYR',
+        value:    amount,
+      },
+      customer_payer: {                              // required by Yuno
+        first_name: 'Guest',
+        last_name:  'Customer',
+        email:      'guest@example.com',
+        country:    'MY',
       },
       payment_method: {
-        type:     yunoPaymentMethod,                 // 'DUIT_NOW' | 'TOUCH_N_GO'
-        workflow: 'REDIRECT',
+        type: yunoPaymentMethod,                     // 'DUIT_NOW' | 'TOUCH_N_GO'
       },
-      return_url:  yunoReturnUrl,
-      webhook_url: `${config.adapter.baseUrl}/yuno/webhook`,
+      checkout: {                                    // required — return_url lives here
+        return_url:  yunoReturnUrl,
+        webhook_url: `${config.adapter.baseUrl}/yuno/webhook`,
+      },
     };
 
     console.log('[/yuno/payments] Calling Yuno:', JSON.stringify(yunoBody, null, 2));
