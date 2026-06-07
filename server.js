@@ -317,22 +317,30 @@ app.post('/yuno/payments', async (req, res) => {
 // GET /yuno/return
 // Xendit/Yuno redirects the customer here after payment (success or failure).
 //
-// ARCHITECTURE — mirrors PayPal adapter approved_handler.go exactly:
+// CPMT FLOW — discovered from orchestration_interface_test_adapter.rb:
 //
-//   1. POST /v1/payment_attempt_records/{par}/report_authenticated
-//      → Marks the PAR as "authenticated" on Stripe's side.
-//        THIS is the trigger that causes Stripe to fire the 2nd confirm_payment.
-//        Without this call the PAR stays in requires_action forever → spinner.
+//   For CPMT there is NO second confirm_payment from Stripe.
+//   The adapter drives the PAR directly to a terminal state, then redirects.
+//   When the customer lands on URL 2, Stripe Checkout reads the PAR state
+//   and shows success if guaranteed, error if failed.
 //
-//   2. GET  /v1/payment_orchestration/get_return_url/{par}
-//      → Fetches the live Stripe Checkout URL (URL 2) with redirect_pm_type + lid.
-//        Fallback: use the return_url stored from the 1st confirm_payment call.
+//   SUCCESS path (customer paid at Yuno):
+//     1. POST /v1/payment_attempt_records/{par}/report_authorized
+//        → authorized_at = now (PAR transitions to authorized)
 //
-//   3. 302 → Stripe Checkout URL
-//      → Customer lands on Stripe Checkout, which fires 2nd confirm_payment.
-//      → We return { status: "guaranteed" } → session closes ✅
+//     2. POST /v1/payment_attempt_records/{par}/report_guaranteed
+//        → guaranteed_at = now (PAR transitions to guaranteed — terminal success)
 //
-// Even on error (report fails, URL fetch fails) we still redirect — same as PayPal adapter.
+//     3. GET /v1/payment_orchestration/get_return_url/{par}
+//        → Fetches Stripe Checkout URL 2 (with redirect_pm_type + lid).
+//          Fallback: use the return_url stored from the 1st confirm_payment call.
+//
+//     4. 302 → Stripe Checkout URL 2
+//        → Checkout JS sees PAR = guaranteed → shows success ✅
+//
+//   FAILURE path: skip steps 1-2, call report_failed instead, same redirect.
+//
+//   Even on API error we still redirect — Stripe Checkout will show what it can.
 // ═════════════════════════════════════════════════════════════════════════════
 app.get('/yuno/return', async (req, res) => {
   const par = req.query.par;
@@ -353,40 +361,109 @@ app.get('/yuno/return', async (req, res) => {
   const { yunoPaymentId, stripeReturnUrl } = session;
   console.log('[/yuno/return] Session found. yunoPaymentId:', yunoPaymentId);
 
+  // ── Step 0: log Yuno status (informational — DO NOT gate on this) ───────────
+  // Architecture: Stripe → Yuno (orchestrator) → Xendit (PSP)
+  //
+  // Timing issue: Xendit redirects the customer to callback_url IMMEDIATELY after
+  // the customer pays. But Xendit webhooks Yuno asynchronously (seconds later).
+  // So when /yuno/return fires, Yuno is still PENDING even though Xendit succeeded.
+  //
+  // The Xendit redirect IS the success signal — same as the test adapter callback
+  // which calls ReportAuthorized/ReportGuaranteed the moment the redirect arrives.
+  //
+  // PoC approach: trust the Xendit redirect. Log Yuno status for debugging only.
+  // Production approach: also listen for the Yuno→us webhook (POST /yuno/webhook)
+  // as secondary confirmation, but Stripe is already closed by then.
+  //
+  // The Xendit→Yuno webhook is Yuno's responsibility. They register their own
+  // endpoint at Xendit (e.g. https://api-sandbox.y.uno/xendit/callback).
+  // If Yuno stays PENDING after Xendit succeeds in sandbox → ask Chee to verify
+  // Xendit sandbox webhook is configured in Yuno's sandbox dashboard.
+  try {
+    const yunoStatusResp = await axios.get(
+      `${config.yuno.baseUrl}/v1/payments/${yunoPaymentId}`,
+      { headers: {
+          'public-api-key':      config.yuno.publicKey  || '',
+          'private-secret-key':  config.yuno.privateKey || '',
+          'merchant-account-id': config.yuno.accountId,
+        }
+      }
+    );
+    // Full dump — use this to find the correct status field name
+    console.log('[/yuno/return] Yuno payment status snapshot (for debug):',
+      JSON.stringify(yunoStatusResp.data, null, 2));
+  } catch (e) {
+    console.log('[/yuno/return] Yuno status fetch failed (non-blocking):',
+      e.response?.status, e.response?.data?.message || e.message);
+  }
+
+  // Xendit redirect = success signal. Proceed unconditionally.
+  const yunoSucceeded = true;
+
   const stripeHeaders = {
     'Authorization':  `Bearer ${config.stripe.secretKey}`,
     'Stripe-Version': '2025-03-31.basil; checkout_merchant_instructed_orchestration_preview=v1',
     'Content-Type':   'application/x-www-form-urlencoded',
   };
 
-  // ── Step 1: report_authenticated → the critical Stripe API call ───────────
-  // Source: approved_handler.go line 69 — stripeClient.ReportAuthenticatedPayment(...)
-  // This transitions the PAR from requires_action → authenticated.
-  // Stripe won't fire the 2nd confirm_payment until this is called.
-  try {
-    const authTs = Math.floor(Date.now() / 1000);
-    const authResp = await axios.post(
-      `https://api.stripe.com/v1/payment_attempt_records/${par}/report_authenticated`,
-      `authenticated_at=${authTs}`,
-      { headers: stripeHeaders }
-    );
-    console.log('[/yuno/return] ✅ report_authenticated succeeded. Status:', authResp.status);
-    session.confirmed = true;
-    sessions.set(par, session);
-  } catch (e) {
-    // Log full error for debugging but DON'T block — same as PayPal adapter behaviour
-    console.error('[/yuno/return] ⚠️  report_authenticated failed:',
-      e.response?.status, JSON.stringify(e.response?.data));
-    // Mark optimistically — Xendit redirected here, so payment likely succeeded.
-    // If Stripe rejects it, the 2nd confirm_payment will still handle it.
-    session.confirmed = true;
-    sessions.set(par, session);
+  const now = Math.floor(Date.now() / 1000);
+
+  if (yunoSucceeded) {
+    // ── Step 1: report_authorized ───────────────────────────────────────────
+    // Source: orchestration_interface_test_adapter.rb ReportAuthorized.call(...)
+    // Transitions PAR: requires_action → authorized
+    // Body: authorized_at=<unix_timestamp>
+    try {
+      const r = await axios.post(
+        `https://api.stripe.com/v1/payment_attempt_records/${par}/report_authorized`,
+        `authorized_at=${now}`,
+        { headers: stripeHeaders }
+      );
+      console.log('[/yuno/return] ✅ report_authorized succeeded. Status:', r.status);
+      session.authorized = true;
+      sessions.set(par, session);
+    } catch (e) {
+      console.error('[/yuno/return] ⚠️  report_authorized failed:',
+        e.response?.status, JSON.stringify(e.response?.data));
+    }
+
+    // ── Step 2: report_guaranteed ───────────────────────────────────────────
+    // Source: orchestration_interface_test_adapter.rb ReportGuaranteed.call(...)
+    // Transitions PAR: authorized → guaranteed (terminal success)
+    // Checkout JS polls PAR → sees guaranteed → shows success. No 2nd adapter call.
+    try {
+      const r = await axios.post(
+        `https://api.stripe.com/v1/payment_attempt_records/${par}/report_guaranteed`,
+        `guaranteed_at=${now}`,
+        { headers: stripeHeaders }
+      );
+      console.log('[/yuno/return] ✅ report_guaranteed succeeded. Status:', r.status);
+      session.confirmed = true;
+      sessions.set(par, session);
+    } catch (e) {
+      console.error('[/yuno/return] ⚠️  report_guaranteed failed:',
+        e.response?.status, JSON.stringify(e.response?.data));
+    }
+  } else {
+    // ── Failure path: report_failed ─────────────────────────────────────────
+    // Yuno said the payment failed — tell Stripe so Checkout shows an error.
+    try {
+      const r = await axios.post(
+        `https://api.stripe.com/v1/payment_attempt_records/${par}/report_failed`,
+        `failed_at=${now}&error_code=payment_declined`,
+        { headers: stripeHeaders }
+      );
+      console.log('[/yuno/return] report_failed succeeded. Status:', r.status);
+    } catch (e) {
+      console.error('[/yuno/return] ⚠️  report_failed failed:',
+        e.response?.status, JSON.stringify(e.response?.data));
+    }
   }
 
-  // ── Step 2: fetch dynamic return URL from Stripe ──────────────────────────
-  // Source: approved_handler.go line 50 — stripeClient.GetReturnUrl(...)
-  // This gives us the live Stripe Checkout URL (URL 2) with redirect_pm_type + lid.
-  // These params are required for Stripe Checkout to recognise the return.
+  // ── Step 3: fetch dynamic return URL from Stripe ──────────────────────────
+  // Source: orchestration_interface_test_adapter.rb GetReturnUrl.call(...)
+  // Gets Stripe Checkout URL 2 with the redirect_pm_type + lid correlation params.
+  // These tell Checkout to check the PAR state (which is now guaranteed).
   let returnUrl = stripeReturnUrl; // fallback: stored from 1st confirm_payment
   try {
     const urlResp = await axios.get(
@@ -404,17 +481,34 @@ app.get('/yuno/return', async (req, res) => {
     console.log('[/yuno/return] Falling back to stored return URL');
   }
 
-  // ── Step 3: redirect customer → Stripe Checkout ──────────────────────────
-  console.log('[/yuno/return] Session updated. confirmed:', session.confirmed);
-  console.log('[/yuno/return] Redirecting to Stripe:', returnUrl);
+  // ── Step 4: redirect customer → Stripe Checkout ──────────────────────────
+  console.log('[/yuno/return] confirmed:', session.confirmed, '| Redirecting to:', returnUrl);
   res.redirect(302, returnUrl);
 });
 
 
 // ═════════════════════════════════════════════════════════════════════════════
 // POST /yuno/webhook
-// Yuno sends async payment notifications here.
-// Useful for confirming final payment status independently of the redirect.
+// Yuno sends async payment notifications here (after Xendit notifies Yuno).
+//
+// THIS IS THE FALLBACK LOOP-CLOSER.
+//
+// Flow:
+//   Xendit processes payment → Xendit POSTs to Yuno's internal endpoint
+//   → Yuno updates payment status → Yuno POSTs to THIS endpoint
+//
+// We registered this URL with Yuno when creating the payment:
+//   checkout.webhook_url = ADAPTER_BASE_URL/yuno/webhook
+//
+// Why this matters: Xendit redirects the customer synchronously (/yuno/return),
+// but Xendit's webhook to Yuno is async. In some cases (browser closed, network
+// issues), /yuno/return may not fire. This webhook closes the loop anyway.
+//
+// Idempotency: if /yuno/return already called report_guaranteed, session.confirmed
+// will be true and we skip — Stripe would reject a double-call anyway.
+//
+// The PAR comes from merchant_order_id — we set that = PAR when creating the
+// Yuno payment, so Yuno echoes it back in every webhook.
 // ═════════════════════════════════════════════════════════════════════════════
 app.post('/yuno/webhook', async (req, res) => {
   console.log('\n[/yuno/webhook] Yuno event received');
@@ -424,55 +518,89 @@ app.post('/yuno/webhook', async (req, res) => {
   } catch {
     body = req.body.toString();
   }
-  console.log('[/yuno/webhook] Payload:', JSON.stringify(body, null, 2));
+  // Full dump — Yuno webhook schema varies; log everything to find field names
+  console.log('[/yuno/webhook] Full payload:', JSON.stringify(body, null, 2));
 
-  // Acknowledge immediately so Yuno doesn't retry
+  // Acknowledge immediately — Yuno retries if we don't respond fast
   res.status(200).json({ received: true });
 
-  // ── Report outcome to Stripe Payment Records API ──────────────────────────
-  // Yuno webhook statuses: SUCCEEDED, FAILED, PENDING, REFUNDED, etc.
-  const yunoStatus    = body?.payment_status || body?.status;
-  const yunoPaymentId = body?.payment_id     || body?.id;
-  // merchant_order_id = par_test_... (we set this when creating the Yuno payment)
-  const par           = body?.merchant_order_id;
+  // ── Parse webhook ─────────────────────────────────────────────────────────
+  // merchant_order_id = the PAR we passed when creating the Yuno payment
+  const par        = body?.merchant_order_id;
+  const yunoStatus = body?.payment_workflow_status
+                  || body?.payment_status
+                  || body?.status;
 
-  console.log(`[/yuno/webhook] status=${yunoStatus} payment_id=${yunoPaymentId} par=${par}`);
+  console.log(`[/yuno/webhook] PAR: ${par} | Yuno status: ${yunoStatus}`);
 
-  if (!par || !config.stripe.secretKey) {
-    console.log('[/yuno/webhook] Missing PAR or Stripe key — skipping Payment Records report');
+  if (!par) {
+    console.log('[/yuno/webhook] No merchant_order_id in payload — cannot map to PAR. Skipping.');
     return;
   }
 
-  try {
-    const stripeHeaders = {
-      'Authorization': `Bearer ${config.stripe.secretKey}`,
-      'Stripe-Version': '2025-03-31.basil; checkout_merchant_instructed_orchestration_preview=v1',
-    };
-    // Look up parent pr_... from par_...
-    const parData = await axios.get(
-      `https://api.stripe.com/v1/payment_attempt_records/${par}`,
-      { headers: stripeHeaders }
-    );
-    const prId = parData.data.payment_record;
+  // ── Idempotency check ─────────────────────────────────────────────────────
+  // If /yuno/return already ran and called report_guaranteed, skip.
+  const session = sessions.get(par);
+  if (session?.confirmed) {
+    console.log('[/yuno/webhook] PAR already confirmed via /yuno/return. No action needed.');
+    return;
+  }
 
-    if (yunoStatus === 'SUCCEEDED' || yunoStatus === 'CAPTURED') {
-      await axios.post(
-        `https://api.stripe.com/v1/payment_records/${prId}/report_payment_attempt_guaranteed`,
-        '',
-        { headers: { ...stripeHeaders, 'Content-Type': 'application/x-www-form-urlencoded' } }
-      );
-      console.log(`[/yuno/webhook] ✅ Reported GUARANTEED to Stripe for PR ${prId}`);
+  const SUCCESS_STATUSES = ['SUCCEEDED', 'CAPTURED', 'APPROVED', 'PAID', 'COMPLETE', 'COMPLETED'];
+  const FAILURE_STATUSES = ['FAILED', 'DECLINED', 'CANCELLED', 'REJECTED', 'EXPIRED', 'ERROR'];
 
-    } else if (yunoStatus === 'FAILED' || yunoStatus === 'CANCELLED' || yunoStatus === 'REJECTED') {
+  const stripeHeaders = {
+    'Authorization':  `Bearer ${config.stripe.secretKey}`,
+    'Stripe-Version': '2025-03-31.basil; checkout_merchant_instructed_orchestration_preview=v1',
+    'Content-Type':   'application/x-www-form-urlencoded',
+  };
+  const now = Math.floor(Date.now() / 1000);
+
+  if (SUCCESS_STATUSES.includes((yunoStatus || '').toUpperCase())) {
+    // ── Yuno confirmed success → drive PAR to guaranteed ───────────────────
+    console.log('[/yuno/webhook] Yuno SUCCESS received. Reporting to Stripe...');
+
+    try {
       await axios.post(
-        `https://api.stripe.com/v1/payment_records/${prId}/report_payment_attempt_failed`,
-        '',
-        { headers: { ...stripeHeaders, 'Content-Type': 'application/x-www-form-urlencoded' } }
+        `https://api.stripe.com/v1/payment_attempt_records/${par}/report_authorized`,
+        `authorized_at=${now}`,
+        { headers: stripeHeaders }
       );
-      console.log(`[/yuno/webhook] ❌ Reported FAILED to Stripe for PR ${prId}`);
+      console.log('[/yuno/webhook] ✅ report_authorized succeeded');
+    } catch (e) {
+      // May already be authorized from /yuno/return — log and continue
+      console.log('[/yuno/webhook] report_authorized:', e.response?.status, e.response?.data?.error?.message);
     }
-  } catch (e) {
-    console.error('[/yuno/webhook] Stripe Payment Records error:', e.response?.data || e.message);
+
+    try {
+      await axios.post(
+        `https://api.stripe.com/v1/payment_attempt_records/${par}/report_guaranteed`,
+        `guaranteed_at=${now}`,
+        { headers: stripeHeaders }
+      );
+      console.log('[/yuno/webhook] ✅ report_guaranteed succeeded — Stripe loop closed via webhook');
+      if (session) { session.confirmed = true; sessions.set(par, session); }
+    } catch (e) {
+      console.error('[/yuno/webhook] report_guaranteed:', e.response?.status, e.response?.data?.error?.message);
+    }
+
+  } else if (FAILURE_STATUSES.includes((yunoStatus || '').toUpperCase())) {
+    // ── Yuno confirmed failure ─────────────────────────────────────────────
+    console.log('[/yuno/webhook] Yuno FAILURE received. Reporting to Stripe...');
+    try {
+      await axios.post(
+        `https://api.stripe.com/v1/payment_attempt_records/${par}/report_failed`,
+        `failed_at=${now}&error_code=payment_declined`,
+        { headers: stripeHeaders }
+      );
+      console.log('[/yuno/webhook] ❌ report_failed succeeded');
+    } catch (e) {
+      console.error('[/yuno/webhook] report_failed:', e.response?.status, e.response?.data?.error?.message);
+    }
+
+  } else {
+    // PENDING, PROCESSING etc — Yuno will send another webhook when terminal
+    console.log(`[/yuno/webhook] Non-terminal status "${yunoStatus}" — waiting for next webhook`);
   }
 });
 
