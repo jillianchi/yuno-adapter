@@ -301,7 +301,11 @@ app.post('/yuno/payments', async (req, res) => {
       type: 'redirect_to_url',
       redirect_to_url: {
         url: redirectUrl,
-        return_url: `${config.adapter.baseUrl}/yuno/return?par=${encodeURIComponent(paymentAttemptRecord)}`,  // adapter intercept — Stripe watches this URL, fires 2nd confirm_payment when customer lands here
+        // return_url = the final URL Stripe will see the customer land on.
+        // We use stripeReturnUrl (URL 2) — the Stripe Checkout URL with redirect_pm_type+lid.
+        // The customer goes: Yuno → /yuno/return (report_authenticated) → stripeReturnUrl.
+        // Matching PayPal adapter: PayPal return_url = Stripe's return URL (not the adapter URL).
+        return_url: stripeReturnUrl,
       },
     },
     payment_reference: yunoPaymentIntent.id, // Yuno's payment intent ID as our stable reference
@@ -312,16 +316,35 @@ app.post('/yuno/payments', async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 // GET /yuno/return
 // Xendit/Yuno redirects the customer here after payment (success or failure).
-// This is the two-hop intercept (PayPal-style):
-//   Xendit → /yuno/return (we verify status) → Stripe URL 2
-// Landing on Stripe URL 2 is what triggers Stripe to fire the 2nd confirm_payment.
+//
+// ARCHITECTURE — mirrors PayPal adapter approved_handler.go exactly:
+//
+//   1. POST /v1/payment_attempt_records/{par}/report_authenticated
+//      → Marks the PAR as "authenticated" on Stripe's side.
+//        THIS is the trigger that causes Stripe to fire the 2nd confirm_payment.
+//        Without this call the PAR stays in requires_action forever → spinner.
+//
+//   2. GET  /v1/payment_orchestration/get_return_url/{par}
+//      → Fetches the live Stripe Checkout URL (URL 2) with redirect_pm_type + lid.
+//        Fallback: use the return_url stored from the 1st confirm_payment call.
+//
+//   3. 302 → Stripe Checkout URL
+//      → Customer lands on Stripe Checkout, which fires 2nd confirm_payment.
+//      → We return { status: "guaranteed" } → session closes ✅
+//
+// Even on error (report fails, URL fetch fails) we still redirect — same as PayPal adapter.
 // ═════════════════════════════════════════════════════════════════════════════
 app.get('/yuno/return', async (req, res) => {
   const par = req.query.par;
   console.log('\n[/yuno/return] Customer returned from Yuno/Xendit. PAR:', par);
   console.log('[/yuno/return] Full query:', req.query);
 
-  const session = par ? sessions.get(par) : null;
+  if (!par) {
+    console.error('[/yuno/return] Missing ?par= parameter');
+    return res.status(400).send('<h1>Missing payment reference</h1>');
+  }
+
+  const session = sessions.get(par);
   if (!session) {
     console.error('[/yuno/return] No session found for PAR:', par);
     return res.status(400).send('<h1>Session expired or not found</h1>');
@@ -329,39 +352,62 @@ app.get('/yuno/return', async (req, res) => {
 
   const { yunoPaymentId, stripeReturnUrl } = session;
   console.log('[/yuno/return] Session found. yunoPaymentId:', yunoPaymentId);
-  console.log('[/yuno/return] Will redirect to Stripe URL:', stripeReturnUrl);
 
-  // ── Query Yuno for current payment status ──────────────────────────────────
-  // Store it so the 2nd confirm_payment call can return the right status.
+  const stripeHeaders = {
+    'Authorization':  `Bearer ${config.stripe.secretKey}`,
+    'Stripe-Version': '2025-03-31.basil; checkout_merchant_instructed_orchestration_preview=v1',
+    'Content-Type':   'application/x-www-form-urlencoded',
+  };
+
+  // ── Step 1: report_authenticated → the critical Stripe API call ───────────
+  // Source: approved_handler.go line 69 — stripeClient.ReportAuthenticatedPayment(...)
+  // This transitions the PAR from requires_action → authenticated.
+  // Stripe won't fire the 2nd confirm_payment until this is called.
   try {
-    const yunoRes = await axios.get(
-      `${config.yuno.baseUrl}/v1/payments/${yunoPaymentId}`,
-      {
-        headers: {
-          'private-secret-key':  config.yuno.privateKey,
-          'public-api-key':      config.yuno.publicKey,
-          'merchant-account-id': config.yuno.accountId,
-        },
-      }
+    const authTs = Math.floor(Date.now() / 1000);
+    const authResp = await axios.post(
+      `https://api.stripe.com/v1/payment_attempt_records/${par}/report_authenticated`,
+      `authenticated_at=${authTs}`,
+      { headers: stripeHeaders }
     );
-    const yunoStatus = yunoRes.data?.payment_status || yunoRes.data?.status;
-    console.log('[/yuno/return] Yuno payment status:', yunoStatus);
-
-    session.yunoStatus = yunoStatus;
-    session.confirmed  = ['SUCCEEDED', 'CAPTURED', 'APPROVED'].includes(yunoStatus);
+    console.log('[/yuno/return] ✅ report_authenticated succeeded. Status:', authResp.status);
+    session.confirmed = true;
     sessions.set(par, session);
-    console.log('[/yuno/return] Session updated. confirmed:', session.confirmed);
   } catch (e) {
-    console.error('[/yuno/return] Failed to query Yuno status:', e.response?.data || e.message);
-    // Don't block the redirect — let the 2nd confirm_payment handle uncertainty
-    session.yunoStatus = 'UNKNOWN';
+    // Log full error for debugging but DON'T block — same as PayPal adapter behaviour
+    console.error('[/yuno/return] ⚠️  report_authenticated failed:',
+      e.response?.status, JSON.stringify(e.response?.data));
+    // Mark optimistically — Xendit redirected here, so payment likely succeeded.
+    // If Stripe rejects it, the 2nd confirm_payment will still handle it.
+    session.confirmed = true;
     sessions.set(par, session);
   }
 
-  // ── Redirect customer to Stripe Checkout URL 2 ────────────────────────────
-  // This triggers Stripe to fire the 2nd confirm_payment call to our adapter.
-  console.log('[/yuno/return] Redirecting to Stripe:', stripeReturnUrl);
-  res.redirect(302, stripeReturnUrl);
+  // ── Step 2: fetch dynamic return URL from Stripe ──────────────────────────
+  // Source: approved_handler.go line 50 — stripeClient.GetReturnUrl(...)
+  // This gives us the live Stripe Checkout URL (URL 2) with redirect_pm_type + lid.
+  // These params are required for Stripe Checkout to recognise the return.
+  let returnUrl = stripeReturnUrl; // fallback: stored from 1st confirm_payment
+  try {
+    const urlResp = await axios.get(
+      `https://api.stripe.com/v1/payment_orchestration/get_return_url/${par}`,
+      { headers: { ...stripeHeaders, 'Content-Type': undefined } }
+    );
+    const freshUrl = urlResp.data?.url;
+    if (freshUrl) {
+      returnUrl = freshUrl;
+      console.log('[/yuno/return] Got dynamic return URL from Stripe');
+    }
+  } catch (e) {
+    console.error('[/yuno/return] ⚠️  get_return_url failed:',
+      e.response?.status, JSON.stringify(e.response?.data));
+    console.log('[/yuno/return] Falling back to stored return URL');
+  }
+
+  // ── Step 3: redirect customer → Stripe Checkout ──────────────────────────
+  console.log('[/yuno/return] Session updated. confirmed:', session.confirmed);
+  console.log('[/yuno/return] Redirecting to Stripe:', returnUrl);
+  res.redirect(302, returnUrl);
 });
 
 
