@@ -178,12 +178,6 @@ app.post('/yuno/payments', async (req, res) => {
   // ── 4. Call Yuno API to create payment session ────────────────────────────
   let yunoPaymentIntent;
   try {
-    // callback_url must be Stripe's own return_url directly.
-    // Stripe's checkout page processes the CPMT return when the PSP redirects here,
-    // closes the session, and sends the customer to success_url.
-    // Intercepting this at /yuno/return breaks Stripe's processing flow.
-    const yunoReturnUrlBase = stripeReturnUrl;
-
     const yunoBody = {
       account_id:        config.yuno.accountId,      // required in body (not just header)
       merchant_order_id: merchantOrderId,
@@ -203,10 +197,11 @@ app.post('/yuno/payments', async (req, res) => {
       payment_method: {
         type: yunoPaymentMethod,
       },
-      // callback_url = top-level field Yuno uses as success_redirect_url when
-      // creating the underlying PSP invoice (confirmed in Yuno docs).
-      // yuno_id is appended after we get the Yuno response (see below).
-      callback_url: yunoReturnUrlBase,
+      // callback_url = Stripe's own return_url sent directly to Yuno.
+      // Yuno passes this to Xendit as success_redirect_url/failure_redirect_url.
+      // When customer completes TNG, Xendit redirects straight to Stripe's checkout page,
+      // which processes the CPMT return and closes the session.
+      callback_url: stripeReturnUrl,
       checkout: {
         webhook_url: `${config.adapter.baseUrl}/yuno/webhook`,
       },
@@ -285,6 +280,7 @@ app.post('/yuno/payments', async (req, res) => {
       type: 'redirect_to_url',
       redirect_to_url: {
         url: redirectUrl,
+        return_url: stripeReturnUrl,  // tells Stripe to call adapter for status check when customer returns
       },
     },
     payment_reference: yunoPaymentIntent.id, // Yuno's payment intent ID as our stable reference
